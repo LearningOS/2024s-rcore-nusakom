@@ -43,7 +43,13 @@ pub fn sys_yield() -> isize {
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
-    -1
+    let us = get_time_us();
+    let ts = translated_struct_ptr(current_user_token(), _ts);
+    *ts = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
@@ -51,7 +57,15 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
 pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
     trace!("kernel: sys_task_info NOT IMPLEMENTED YET!");
-    -1
+
+    let ti = translated_struct_ptr(current_user_token(), _ti);
+
+    *ti = TaskInfo {
+        status: TaskStatus::Running,
+        syscall_times: get_sys_call_times(),
+        time: get_task_run_times(),
+    };
+    0
 }
 
 // YOUR JOB: Implement mmap.
