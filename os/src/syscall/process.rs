@@ -96,6 +96,6 @@ pub fn sys_sbrk(size: i32) -> isize {
     if let Some(old_brk) = change_program_brk(size) {
         old_brk as isize
     } else {
-        -1g
+        -1
     }
 }
