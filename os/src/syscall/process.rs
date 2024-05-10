@@ -1,9 +1,14 @@
 //! Process management syscalls
+
 use crate::{
     config::MAX_SYSCALL_NUM,
+    mm::translated_struct_ptr,
     task::{
-        change_program_brk, exit_current_and_run_next, suspend_current_and_run_next, TaskStatus,
+        change_program_brk, current_user_token, exit_current_and_run_next, get_sys_call_times,
+        get_task_run_times, select_cur_task_to_mmap, select_cur_task_to_munmap,
+        suspend_current_and_run_next, TaskStatus,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -70,14 +75,20 @@ pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
 
 // YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+    if _len == 0 {
+        return 0;
+    }
+    if _port & !0x7 != 0 || _port & 0x7 == 0 {
+        return -1;
+    }
     trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    -1
+    select_cur_task_to_mmap(_start, _len, _port)
 }
 
 // YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    -1
+    select_cur_task_to_munmap(_start, _len)
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
@@ -85,6 +96,6 @@ pub fn sys_sbrk(size: i32) -> isize {
     if let Some(old_brk) = change_program_brk(size) {
         old_brk as isize
     } else {
-        -1
+        -1g
     }
 }
