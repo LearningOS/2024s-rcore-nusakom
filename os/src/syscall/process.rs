@@ -4,8 +4,8 @@ use crate::{
     config::MAX_SYSCALL_NUM,
     mm::translated_struct_ptr,
     task::{
-        change_program_brk, current_user_token, exit_current_and_run_next, get_sys_call_times,
-        get_task_run_times, select_cur_task_to_mmap, select_cur_task_to_munmap,
+        change_program_brk, current_user_token, exit_current_and_run_next, get_task_run_times,
+        select_cur_task_to_mmap, select_cur_task_to_munmap,
         suspend_current_and_run_next, TaskStatus,
     },
     timer::get_time_us,

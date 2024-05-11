@@ -27,7 +27,10 @@ const SYSCALL_TASK_INFO: usize = 410;
 
 mod fs;
 mod process;
-
+// 在 task 模块中定义并导出 increase_sys_call
+pub fn increase_sys_call() {
+    // 实现
+}
 use crate::task::increase_sys_call;
 use fs::*;
 use process::*;
