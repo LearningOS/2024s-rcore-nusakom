@@ -485,7 +485,7 @@ pub fn remap_test() {
 pub fn m_map(token: usize, start: usize, len: usize, port: usize) -> isize{
     let flags = MapPermission::from_usize(port);
     //let mut page_table = PageTable::from_token(token);
-    let result=0;
+    let result = 0;
     let new_area = MapArea::new(VirtAddr::from(start), VirtAddr::from(start + len), MapType::Framed, flags);
 
 
