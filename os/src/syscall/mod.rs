@@ -26,15 +26,15 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_TASK_INFO: usize = 410;
 
 mod fs;
-pub mod process;
+mod process;
 
 use fs::*;
 use process::*;
 
-use crate::task::record_syscall;
+use crate::task::inc_syscall_times;
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
-    record_syscall(syscall_id);// lab3 add
+    inc_syscall_times(syscall_id);
     match syscall_id {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),

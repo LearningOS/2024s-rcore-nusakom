@@ -1,48 +1,137 @@
-//! The global allocator
-use crate::config::KERNEL_HEAP_SIZE;
-use buddy_system_allocator::LockedHeap;
+//! Implementation of [`FrameAllocator`] which
+//! controls all the frames in the operating system.
 
-#[global_allocator]
-/// heap allocator instance
-static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
+use super::{PhysAddr, PhysPageNum};
+use crate::config::MEMORY_END;
+use crate::sync::UPSafeCell;
+use alloc::vec::Vec;
+use core::fmt::{self, Debug, Formatter};
+use lazy_static::*;
 
-#[alloc_error_handler]
-/// panic when heap allocation error occurs
-pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
-    panic!("Heap allocation error, layout = {:?}", layout);
+/// tracker for physical page frame allocation and deallocation
+pub struct FrameTracker {
+    /// physical page number
+    pub ppn: PhysPageNum,
 }
-/// heap space ([u8; KERNEL_HEAP_SIZE])
-static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
-/// initiate heap allocator
-pub fn init_heap() {
-    unsafe {
-        HEAP_ALLOCATOR
-            .lock()
-            .init(HEAP_SPACE.as_ptr() as usize, KERNEL_HEAP_SIZE);
+
+impl FrameTracker {
+    /// Create a new FrameTracker
+    pub fn new(ppn: PhysPageNum) -> Self {
+        // page cleaning
+        let bytes_array = ppn.get_bytes_array();
+        for i in bytes_array {
+            *i = 0;
+        }
+        Self { ppn }
     }
+}
+
+impl Debug for FrameTracker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("FrameTracker:PPN={:#x}", self.ppn.0))
+    }
+}
+
+impl Drop for FrameTracker {
+    fn drop(&mut self) {
+        frame_dealloc(self.ppn);
+    }
+}
+
+trait FrameAllocator {
+    fn new() -> Self;
+    fn alloc(&mut self) -> Option<PhysPageNum>;
+    fn dealloc(&mut self, ppn: PhysPageNum);
+}
+/// an implementation for frame allocator
+pub struct StackFrameAllocator {
+    current: usize,
+    end: usize,
+    recycled: Vec<usize>,
+}
+
+impl StackFrameAllocator {
+    pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
+        self.current = l.0;
+        self.end = r.0;
+        // trace!("last {} Physical Frames.", self.end - self.current);
+    }
+}
+impl FrameAllocator for StackFrameAllocator {
+    fn new() -> Self {
+        Self {
+            current: 0,
+            end: 0,
+            recycled: Vec::new(),
+        }
+    }
+    fn alloc(&mut self) -> Option<PhysPageNum> {
+        if let Some(ppn) = self.recycled.pop() {
+            Some(ppn.into())
+        } else if self.current == self.end {
+            None
+        } else {
+            self.current += 1;
+            Some((self.current - 1).into())
+        }
+    }
+    fn dealloc(&mut self, ppn: PhysPageNum) {
+        let ppn = ppn.0;
+        // validity check
+        if ppn >= self.current || self.recycled.iter().any(|&v| v == ppn) {
+            panic!("Frame ppn={:#x} has not been allocated!", ppn);
+        }
+        // recycle
+        self.recycled.push(ppn);
+    }
+}
+
+type FrameAllocatorImpl = StackFrameAllocator;
+
+lazy_static! {
+    /// frame allocator instance through lazy_static!
+    pub static ref FRAME_ALLOCATOR: UPSafeCell<FrameAllocatorImpl> =
+        unsafe { UPSafeCell::new(FrameAllocatorImpl::new()) };
+}
+/// initiate the frame allocator using `ekernel` and `MEMORY_END`
+pub fn init_frame_allocator() {
+    extern "C" {
+        fn ekernel();
+    }
+    FRAME_ALLOCATOR.exclusive_access().init(
+        PhysAddr::from(ekernel as usize).ceil(),
+        PhysAddr::from(MEMORY_END).floor(),
+    );
+}
+
+/// Allocate a physical page frame in FrameTracker style
+pub fn frame_alloc() -> Option<FrameTracker> {
+    FRAME_ALLOCATOR
+        .exclusive_access()
+        .alloc()
+        .map(FrameTracker::new)
+}
+
+/// Deallocate a physical page frame with a given ppn
+pub fn frame_dealloc(ppn: PhysPageNum) {
+    FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
 }
 
 #[allow(unused)]
-pub fn heap_test() {
-    use alloc::boxed::Box;
-    use alloc::vec::Vec;
-    extern "C" {
-        fn sbss();
-        fn ebss();
+/// a simple test for frame allocator
+pub fn frame_allocator_test() {
+    let mut v: Vec<FrameTracker> = Vec::new();
+    for i in 0..5 {
+        let frame = frame_alloc().unwrap();
+        println!("{:?}", frame);
+        v.push(frame);
     }
-    let bss_range = sbss as usize..ebss as usize;
-    let a = Box::new(5);
-    assert_eq!(*a, 5);
-    assert!(bss_range.contains(&(a.as_ref() as *const _ as usize)));
-    drop(a);
-    let mut v: Vec<usize> = Vec::new();
-    for i in 0..500 {
-        v.push(i);
+    v.clear();
+    for i in 0..5 {
+        let frame = frame_alloc().unwrap();
+        println!("{:?}", frame);
+        v.push(frame);
     }
-    for (i, val) in v.iter().take(500).enumerate() {
-        assert_eq!(*val, i);
-    }
-    assert!(bss_range.contains(&(v.as_ptr() as usize)));
     drop(v);
-    println!("heap_test passed!");
+    println!("frame_allocator_test passed!");
 }

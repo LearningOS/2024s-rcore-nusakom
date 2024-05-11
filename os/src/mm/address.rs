@@ -7,15 +7,7 @@ const PA_WIDTH_SV39: usize = 56;
 const VA_WIDTH_SV39: usize = 39;
 const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
 const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
-use core::ops::Sub;
-/// lab4 add
-impl Sub<usize> for VirtPageNum {
-    type Output = VirtPageNum;
 
-    fn sub(self, rhs: usize) -> VirtPageNum {
-        VirtPageNum(self.0 - rhs)
-    }
-}
 /// physical address
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct PhysAddr(pub usize);
@@ -162,22 +154,7 @@ impl From<PhysPageNum> for PhysAddr {
         Self(v.0 << PAGE_SIZE_BITS)
     }
 }
-/// lab4 实现 BitOr trait
-impl core::ops::BitOr<usize> for PhysPageNum {
-    type Output = PhysPageNum;
 
-    fn bitor(self, rhs: usize) -> Self::Output {
-        PhysPageNum(self.0 | rhs)
-    }
-}
-/// lab4 实现 Shl trait
-impl core::ops::Shl<usize> for PhysPageNum {
-    type Output = PhysPageNum;
-
-    fn shl(self, rhs: usize) -> Self::Output {
-        PhysPageNum(self.0 << rhs)
-    }
-}
 impl VirtPageNum {
     /// Get the indexes of the page table entry
     pub fn indexes(&self) -> [usize; 3] {
@@ -192,14 +169,6 @@ impl VirtPageNum {
 }
 
 impl PhysAddr {
-    /// lab4
-    pub fn combine(ppn: PhysPageNum, offset: usize) -> PhysAddr {
-        // 
-        let phys_addr = (ppn<< 12) | offset;
-        let value: usize = usize::from(phys_addr);
-        PhysAddr(value)
-    }
-
     ///Get mutable reference to `PhysAddr` value
     /// Get the mutable reference of physical address
     pub fn get_mut<T>(&self) -> &'static mut T {
@@ -235,7 +204,7 @@ impl StepByOne for VirtPageNum {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 /// a simple range structure for type T
 pub struct SimpleRange<T>
 where
@@ -252,11 +221,53 @@ where
         assert!(start <= end, "start {:?} > end {:?}!", start, end);
         Self { l: start, r: end }
     }
+    pub fn by_len(start: T, len: usize) -> Self {
+        let mut end = start;
+        for _ in 0..len {
+            end.step();
+        }
+        Self::new(start, end)
+    }
     pub fn get_start(&self) -> T {
         self.l
     }
     pub fn get_end(&self) -> T {
         self.r
+    }
+    pub fn is_empty(&self) -> bool {
+        self.l >= self.r
+    }
+    pub fn contains(&self, v: &T) -> bool {
+        self.l <= *v && *v < self.r
+    }
+    pub fn intersection(&self, other: &Self) -> Self {
+        let maxl = if other.l < self.l {self.l} else {other.l};
+        let minr = if other.r < self.r {other.r} else {self.r};
+        let r = if minr < maxl {maxl} else {minr};
+        Self {l:maxl, r}
+    }
+    pub fn intersects(&self, other: &Self) -> bool {
+        !self.intersection(&other).is_empty()
+    }
+    fn exclude_lefthalf(&self, other: &Self) -> Self {
+        let t = 
+            if other.l < self.l {self.l} 
+            else if other.l <= self.r {other.l} 
+            else {self.r};
+        Self {l:self.l, r:t}
+    }
+    fn exclude_righthalf(&self, other: &Self) -> Self {
+        let t = 
+            if other.r > self.r {self.r} 
+            else if other.r >= self.l {other.r}
+            else {self.l};
+        Self {l:t, r:self.r}
+    }
+    pub fn exclude(&self, other: &Self) -> (Self, Self, Self) {
+        let l = self.exclude_lefthalf(other);
+        let r = self.exclude_righthalf(other);
+        let rem = Self {l:l.r, r: r.l};
+        (l, r, rem)
     }
 }
 impl<T> IntoIterator for SimpleRange<T>
@@ -291,7 +302,7 @@ where
 {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.end {
+        if self.current >= self.end {
             None
         } else {
             let t = self.current;
@@ -301,4 +312,4 @@ where
     }
 }
 /// a simple range structure for virtual page number
-pub type VPNRange = SimpleRange<VirtPageNum>;
+pub type VPNRange = SimpleRange<VirtPageNum

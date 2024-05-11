@@ -1,38 +1,28 @@
 //! Process management syscalls
-use crate::{
-    config::MAX_SYSCALL_NUM,
-    task::{
-        change_program_brk, exit_current_and_run_next, suspend_current_and_run_next, TaskStatus,current_memory_set_munmap,current_id,task_map,task_munmap
-    },
-};
-/// lab4 add
-use crate::task::get_task_info;
-pub use crate::mm::memory_set::MemorySet;
+use core::mem::size_of;
 
-use crate::mm::PhysAddr;
-use crate::task::current_user_token;
-use crate::mm::VirtAddr;
-use crate::timer::get_time_ms;
-use crate::mm::page_table::PageTable;
-use crate::config::PAGE_SIZE;
-use crate::mm::VPNRange;
+use crate::{
+    config::MAX_SYSCALL_NUM, mm::{translated_byte_buffer, MapPermission, VirtAddr}, task::{
+        change_program_brk, current_user_token, exit_current_and_run_next, get_dispatched_time, get_syscall_times, get_task_status, mmap, munmap, suspend_current_and_run_next, TaskStatus
+    }
+};
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct TimeVal {
     pub sec: usize,
-    pub msec: usize,
+    pub usec: usize,
 }
 
 /// Task information
 #[allow(dead_code)]
 pub struct TaskInfo {
     /// Task status in it's life cycle
-    pub status: TaskStatus,
+    status: TaskStatus,
     /// The numbers of syscall called by task
-    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+    syscall_times: [u32; MAX_SYSCALL_NUM],
     /// Total running time of task
-    pub time: usize,
+    time: usize,
 }
 
 /// task exits and submit an exit code
@@ -49,21 +39,35 @@ pub fn sys_yield() -> isize {
     0
 }
 
+fn copy_to_segs(segs: alloc::vec::Vec<&mut [u8]>, data: &[u8]) {
+    let total = segs.iter().map(|x|{(**x).len()}).sum::<usize>();
+    assert_eq!(total, data.len(), "copy_to_segs cannot proceed: length not equal");
+    let mut idx = 0;
+    for r in segs.into_iter() {
+        for b in r.iter_mut() {
+            *b = data[idx];
+            idx = idx + 1;
+        }
+    }
+}
+
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    //trace!("kernel: sys_get_time");
-    let virt_addr = VirtAddr(_ts as usize);
-    if let Some(phys_addr) = virt2phys_addr(virt_addr) {
-        let us = get_time_ms() + 1000;
-        let kernel_ts = phys_addr.0 as *mut TimeVal;
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel: sys_get_time");
+    const SIZE: usize = size_of::<TimeVal>();
+    if let Ok(regions) = translated_byte_buffer(current_user_token(), ts as *const u8, SIZE) {
+        let us = crate::timer::get_time_us();
+        let mut buffer = [0u8; SIZE];
         unsafe {
-            *kernel_ts = TimeVal {
-                sec: us / 1_000,
-                msec: 1 + (us % 1_000),
+            let raw_ptr = buffer.as_mut_ptr() as usize as *mut TimeVal;
+            *raw_ptr = TimeVal {
+                sec: us / 1_000_000,
+                usec: us % 1_000_000,
             };
         }
+        copy_to_segs(regions, &buffer);
         0
     } else {
         -1
@@ -73,10 +77,18 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 /// YOUR JOB: Finish sys_task_info to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
-pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
-    let virt_addr = VirtAddr(_ti as usize);
-    if let Some(phys_addr) = virt2phys_addr(virt_addr) {
-        get_task_info(phys_addr.0 as *mut TaskInfo);
+pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
+    trace!("kernel: sys_task_info");
+    const SIZE: usize = size_of::<TaskInfo>();
+    if let Ok(regions) = translated_byte_buffer(current_user_token(), ti as *const u8, SIZE) {
+        let mut buffer = alloc::vec![0u8; SIZE]; // size of TaskInfo is too large, so we choose to allocate on kernel heap
+        unsafe {
+            let ref_coe = (buffer.as_mut_ptr() as usize as *mut TaskInfo).as_mut().unwrap();
+            ref_coe.time = crate::timer::get_time_ms() - get_dispatched_time();
+            ref_coe.status = get_task_status();
+            get_syscall_times(&mut ref_coe.syscall_times);
+        }
+        copy_to_segs(regions, &buffer);
         0
     } else {
         -1
@@ -84,34 +96,29 @@ pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
 }
 
 // YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    
-    task_map(_start,_len,_port)
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel: sys_mmap");
+    if start % crate::config::PAGE_SIZE != 0 {
+        return -1;
+    }
+    if prot & (!0x7) != 0 || prot & 0x7 == 0 {
+        return -1;
+    }
+    let start_va: VirtAddr = start.into();
+    let end_va: VirtAddr = (start + len).into();
+    let flags = (prot as u8) << 1;
+    mmap(start_va, end_va, MapPermission::from_bits(flags).unwrap() | MapPermission::U)
 }
 
 // YOUR JOB: Implement munmap.
 pub fn sys_munmap(start: usize, len: usize) -> isize {
-    //trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    // if (start & (PAGE_SIZE - 1)) != 0 {
-    //     return -1;
-    // }
-
-    // let len = ( (len + PAGE_SIZE - 1) / PAGE_SIZE ) * PAGE_SIZE;
-    // let start_vpn =  VirtAddr::from(start).floor();
-    // let end_vpn =  VirtAddr::from(start + len - 4095).floor();
-    // println!("current_id is :{:?}   unmap startVPN is: {:?}",current_id(), start_vpn);
-    // println!("current_id is :{:?}   unmap endVPN is: {:?}",current_id(), end_vpn);
-    // let page_table_user = PageTable::from_token(current_user_token());
-    // // make sure there are no unmapped pages in [start..start+len)
-    // for vpn in VPNRange::new(start_vpn, end_vpn) {
-    //     if let None = page_table_user.translate(vpn) {
-    //         println!("there are no unmapped pages {:?}", vpn);
-    //         return -1;
-    //     }
-    // }
-    
-    // current_memory_set_munmap( VirtAddr::from(start), VirtAddr::from(start + len))
-    task_munmap(start,len)
+    trace!("kernel: sys_munmap");
+    if start % crate::config::PAGE_SIZE != 0 {
+        return -1;
+    }
+    let start_va: VirtAddr = start.into();
+    let end_va: VirtAddr = (start + len).into();
+    munmap(start_va, end_va)
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
@@ -120,19 +127,5 @@ pub fn sys_sbrk(size: i32) -> isize {
         old_brk as isize
     } else {
         -1
-    }
-}
-/// lab4add
-fn virt2phys_addr(virt_addr: VirtAddr) -> Option<PhysAddr> {
-    let offset = virt_addr.page_offset();
-    let vpn = virt_addr.floor();
-    let ppn = PageTable::from_token(current_user_token())
-        .translate(vpn)
-        .map(|entry| entry.ppn());
-    if let Some(ppn) = ppn {
-        Some(PhysAddr::combine(ppn, offset))
-    } else {
-        //println!("virt2phys_addr() fail");
-        None
     }
 }
