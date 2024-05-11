@@ -12,38 +12,26 @@
 const SYSCALL_WRITE: usize = 64;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
-/// yield syscall
-const SYSCALL_YIELD: usize = 124;
-/// gettime syscall
-const SYSCALL_GET_TIME: usize = 169;
-/// sbrk syscall
-const SYSCALL_SBRK: usize = 214;
-/// munmap syscall
-const SYSCALL_MUNMAP: usize = 215;
-/// mmap syscall
-const SYSCALL_MMAP: usize = 222;
-/// taskinfo syscall
-const SYSCALL_TASK_INFO: usize = 410;
+/// yield syscall//! File and filesystem-related syscalls
 
-mod fs;
-mod process;
+use crate::mm::translated_byte_buffer;
+use crate::task::current_user_token;
 
-use fs::*;
-use process::*;
+const FD_STDOUT: usize = 1;
 
-use crate::task::inc_syscall_times;
-/// handle syscall exception with `syscall_id` and other arguments
-pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
-    inc_syscall_times(syscall_id);
-    match syscall_id {
-        SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_EXIT => sys_exit(args[0] as i32),
-        SYSCALL_YIELD => sys_yield(),
-        SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
-        SYSCALL_TASK_INFO => sys_task_info(args[0] as *mut TaskInfo),
-        SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),
-        SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
-        SYSCALL_SBRK => sys_sbrk(args[0] as i32),
-        _ => panic!("Unsupported syscall_id: {}", syscall_id),
+/// write buf of length `len`  to a file with `fd`
+pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
+    trace!("kernel: sys_write");
+    match fd {
+        FD_STDOUT => {
+            let buffers = translated_byte_buffer(current_user_token(), buf, len);
+            for buffer in buffers {
+                print!("{}", core::str::from_utf8(buffer).unwrap());
+            }
+            len as isize
+        }
+        _ => {
+            panic!("Unsupported fd in sys_write!");
+        }
     }
 }
