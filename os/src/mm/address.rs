@@ -60,13 +60,11 @@ impl From<usize> for PhysPageNum {
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        // 取低56位
         Self(v & ((1 << VA_WIDTH_SV39) - 1))
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        // 取低39位
         Self(v & ((1 << VPN_WIDTH_SV39) - 1))
     }
 }
@@ -83,7 +81,6 @@ impl From<PhysPageNum> for usize {
 impl From<VirtAddr> for usize {
     fn from(v: VirtAddr) -> Self {
         if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
-            // 将高25位置为1
             v.0 | (!((1 << VA_WIDTH_SV39) - 1))
         } else {
             v.0
@@ -229,6 +226,26 @@ where
     }
     pub fn get_end(&self) -> T {
         self.r
+    }
+    /// check if two ranges intersect
+    pub fn is_intersect_with(&self, other: &Self) -> bool {
+        (self.l < other.r && self.r > other.l) || (self.l > other.r && self.r < other.l)
+    }
+    /// contain a page number
+    pub fn contain_with(&self, other: &Self) -> bool {
+        self.l <= other.l && self.r >= other.r
+    }
+    /// check if a page number is in the range
+    pub fn contain(&self, p: &T) -> bool {
+        self.l <= *p && self.r > *p
+    }
+    pub fn intersect_with(&self, other: &Self) -> Option<SimpleRange<T>> {
+        if !self.is_intersect_with(other) {
+            return None;
+        }
+        let l = if self.l > other.l { self.l } else { other.l };
+        let r = if self.r < other.r { self.r } else { other.r };
+        Some(SimpleRange::new(l, r))
     }
 }
 impl<T> IntoIterator for SimpleRange<T>

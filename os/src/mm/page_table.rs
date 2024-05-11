@@ -1,6 +1,7 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
-use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use super::err::{TranslateError, TranslateResult};
+use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -67,6 +68,7 @@ impl PageTableEntry {
 /// page table structure
 pub struct PageTable {
     root_ppn: PhysPageNum,
+    /// only include page table frames
     frames: Vec<FrameTracker>,
 }
 
@@ -145,12 +147,12 @@ impl PageTable {
     }
     /// get the token from the page table
     pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0 // 最高 4 位是 8 意味着使用 SV39 分页格式
+        8usize << 60 | self.root_ppn.0
     }
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> TranslateResult<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = start + len;
@@ -158,7 +160,7 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let ppn = page_table.translate(vpn).ok_or(TranslateError::NotMapped)?.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
@@ -169,20 +171,5 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         }
         start = end_va.into();
     }
-    v
-}
-
-/// Translate&Copy a *mut T array to a mutable u8 Vec through page table
-pub fn translated_struct_ptr<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    let page_table = PageTable::from_token(token);
-
-    let va = VirtAddr::from(ptr as usize);
-    let page_off = va.page_offset();
-
-    let vpn = va.floor();
-
-    let mut pa: PhysAddr = page_table.translate(vpn).unwrap().ppn().into();
-    pa.0 += page_off;
-
-    pa.get_mut()
+    Ok(v)
 }
