@@ -1,14 +1,15 @@
 //! Process management syscalls
+use core::{mem::size_of, slice::from_raw_parts};
 
 use crate::{
-    config::MAX_SYSCALL_NUM,
-    mm::translated_struct_ptr,
+    config::{CLOCK_FREQ, MAX_SYSCALL_NUM},
+    mm::{translated_byte_buffer, MapPermission},
     task::{
-        change_program_brk, current_user_token, exit_current_and_run_next, get_sys_call_times,
-        get_task_run_times, select_cur_task_to_mmap, select_cur_task_to_munmap,
-        suspend_current_and_run_next, TaskStatus,
+        change_program_brk, current_start_time, current_syscall_times, current_user_token,
+        exit_current_and_run_next, map_current_task, suspend_current_and_run_next,
+        unmap_current_task, TaskStatus,
     },
-    timer::get_time_us,
+    timer::{get_time, get_time_us},
 };
 
 #[repr(C)]
@@ -49,12 +50,25 @@ pub fn sys_yield() -> isize {
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
     let us = get_time_us();
-    let ts = translated_struct_ptr(current_user_token(), _ts);
-    *ts = TimeVal {
+    let tv = TimeVal {
         sec: us / 1_000_000,
         usec: us % 1_000_000,
     };
-    0
+    let len = size_of::<TimeVal>();
+    let _ts = translated_byte_buffer(current_user_token(), _ts as usize as *const u8, len);
+    if let Ok(_ts) = _ts {
+        let tv_ptr = &tv as *const TimeVal as *const u8;
+        for i in _ts {
+            let src = unsafe { from_raw_parts(tv_ptr, i.len()) };
+            i.copy_from_slice(src);
+            unsafe {
+                let _ = tv_ptr.add(i.len());
+            }
+        }
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
@@ -62,33 +76,70 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
 pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
     trace!("kernel: sys_task_info NOT IMPLEMENTED YET!");
-
-    let ti = translated_struct_ptr(current_user_token(), _ti);
-
-    *ti = TaskInfo {
+    let ti = TaskInfo {
         status: TaskStatus::Running,
-        syscall_times: get_sys_call_times(),
-        time: get_task_run_times(),
+        syscall_times: current_syscall_times(),
+        time: (get_time() - current_start_time()) / (CLOCK_FREQ / 1000),
     };
-    0
+    let len = size_of::<TaskInfo>();
+    let _ti = translated_byte_buffer(current_user_token(), _ti as usize as *const u8, len);
+    if let Ok(_ti) = _ti {
+        let ti_ptr = &ti as *const TaskInfo as *const u8;
+        for i in _ti {
+            let src = unsafe { from_raw_parts(ti_ptr, i.len()) };
+            i.copy_from_slice(src);
+            unsafe {
+                let _ = ti_ptr.add(i.len());
+            }
+        }
+        0
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    if _len == 0 {
-        return 0;
-    }
-    if _port & !0x7 != 0 || _port & 0x7 == 0 {
+    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
+    let mut perm = MapPermission::U;
+    if _start & 0xfff != 0 {
         return -1;
     }
-    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    select_cur_task_to_mmap(_start, _len, _port)
+    if _port & 0b111 == 0 || _port & !0b111 != 0 {
+        return -1;
+    }
+    if _port & 0b1 != 0 {
+        perm = perm | MapPermission::R;
+    }
+    if _port & 0b10 != 0 {
+        perm = perm | MapPermission::W;
+    }
+    if _port & 0b100 != 0 {
+        perm = perm | MapPermission::X;
+    }
+    let start = _start.into();
+    let end = (_start + _len).into();
+
+    if let Ok(()) = map_current_task(start, end, perm) {
+        0
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    select_cur_task_to_munmap(_start, _len)
+    let start = _start.into();
+    let end = (_start + _len).into();
+    if _start & 0xfff != 0 {
+        return -1;
+    }
+    if let Ok(()) = unmap_current_task(start, end) {
+        0
+    } else {
+        -1
+    }
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
