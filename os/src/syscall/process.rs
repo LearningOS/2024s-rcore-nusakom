@@ -1,14 +1,15 @@
 //! Process management syscalls
+use core::{mem::size_of, slice::from_raw_parts};
 
 use crate::{
-    config::MAX_SYSCALL_NUM,
-    mm::translated_struct_ptr,
+    config::{CLOCK_FREQ, MAX_SYSCALL_NUM},
+    mm::{translated_byte_buffer, MapPermission},
     task::{
-        change_program_brk, current_user_token, exit_current_and_run_next, get_task_run_times,
-        select_cur_task_to_mmap, select_cur_task_to_munmap,
-        suspend_current_and_run_next, TaskStatus,
+        change_program_brk, current_start_time, current_syscall_times, current_user_token,
+        exit_current_and_run_next, map_current_task, suspend_current_and_run_next,
+        unmap_current_task, TaskStatus,
     },
-    timer::get_time_us,
+    timer::{get_time, get_time_us},
 };
 
 #[repr(C)]
