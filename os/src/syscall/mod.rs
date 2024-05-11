@@ -26,19 +26,15 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_TASK_INFO: usize = 410;
 
 mod fs;
-mod process;
-// 在 task 模块中定义并导出 increase_sys_call
-pub fn increase_sys_call() {
-    // 实现
-}
-use crate::task::increase_sys_call;
+pub mod process;
+
 use fs::*;
 use process::*;
 
+use crate::task::record_syscall;
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
-    increase_sys_call(syscall_id);
-
+    record_syscall(syscall_id);// lab3 add
     match syscall_id {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
