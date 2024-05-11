@@ -1,4 +1,6 @@
 //! Process management syscalls
+use crate::timer::get_time_us;
+use crate::task::current_user_token;
 use crate::{
     config::MAX_SYSCALL_NUM,
     task::{
