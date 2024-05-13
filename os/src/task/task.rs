@@ -1,16 +1,16 @@
 //! Types related to task management & Functions for completely changing TCB
-use super::{current_task, TaskContext};
+use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
-use crate::fs::{File, Stdin, Stdout};
+use crate::config::{TRAP_CONTEXT_BASE,BIGSTRIDE};
+use crate::fs::{File, Stdin, Stdout, StatMode};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
-use crate::timer::get_time_ms;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use crate::syscall::TaskInfo;
 
 /// Task control block structure
 ///
@@ -18,10 +18,10 @@ use core::cell::RefMut;
 pub struct TaskControlBlock {
     // Immutable
     /// Process identifier
-    pub(crate) pid: PidHandle,
+    pub pid: PidHandle,
 
     /// Kernel stack corresponding to PID
-    pub(crate) kernel_stack: KernelStack,
+    pub kernel_stack: KernelStack,
 
     /// Mutable
     inner: UPSafeCell<TaskControlBlockInner>,
@@ -37,6 +37,11 @@ impl TaskControlBlock {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
     }
+    //  pub fn get_info(&mut self)->&mut TaskInfo{
+    //     self.inner.exclusive_access().get_info()
+    //     // &mut self.task_info
+    // }
+    
 }
 
 pub struct TaskControlBlockInner {
@@ -65,8 +70,7 @@ pub struct TaskControlBlockInner {
 
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
-
-    /// File Descriptor Table: Record the files opened by this task
+    pub fd_stat:Vec<Option<(u32,StatMode)>>,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 
     /// Heap bottom
@@ -75,23 +79,26 @@ pub struct TaskControlBlockInner {
     /// Program break
     pub program_brk: usize,
 
-    /// The start time of task
-    pub task_start_time: usize,
+    /// task info
+    pub task_info:TaskInfo,
 
-    /// The end time of task syscall
-    pub task_lastest_syscall_time: usize,
+    /// stride
+    pub stride:isize,
 
-    /// The numbers of syscall called by task
-    pub task_syscall_trace: [u32; MAX_SYSCALL_NUM],
+    /// stride pass
+    pass:isize,
 
-    /// The stride of the task
-    pub stride: isize,
-
-    /// The priority of the task
-    pub priority: isize,
+    /// priority
+    priority:isize
 }
 
 impl TaskControlBlockInner {
+
+    pub fn get_stride(&self) -> isize{
+        self.stride
+    }
+
+    /// get the trap context
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
         self.trap_cx_ppn.get_mut()
     }
@@ -104,11 +111,27 @@ impl TaskControlBlockInner {
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
+    /// get task_info
+    pub fn get_info(&mut self)->&mut TaskInfo{
+        &mut self.task_info
+    }
+
+    /// set priority
+    pub fn set_proority(&mut self,priority:isize){
+        self.priority=priority;
+        self.pass=BIGSTRIDE/priority;
+    } 
+
+    /// step add pass to stride
+    pub fn step(&mut self){
+        self.stride+=self.pass
+    }
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             fd
         } else {
             self.fd_table.push(None);
+            self.fd_stat.push(None);
             self.fd_table.len() - 1
         }
     }
@@ -142,7 +165,8 @@ impl TaskControlBlock {
                     memory_set,
                     parent: None,
                     children: Vec::new(),
-                    exit_code: 0,
+                    exit_code: 0,                          // don't learn this 
+                    fd_stat:vec![Some((0,StatMode::FILE)),Some((1,StatMode::FILE)),Some((2,StatMode::FILE))],
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -153,11 +177,10 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
-                    task_start_time: get_time_ms(),
-                    task_lastest_syscall_time: get_time_ms(),
-                    task_syscall_trace: [0; MAX_SYSCALL_NUM],
-                    stride: 0,
-                    priority: 0,
+                    task_info:TaskInfo::new(),
+                    stride:0,
+                    pass:BIGSTRIDE/16,
+                    priority:16,
                 })
             },
         };
@@ -236,14 +259,14 @@ impl TaskControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
+                    fd_stat:parent_inner.fd_stat.clone(),
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
-                    task_start_time: parent_inner.task_start_time,
-                    task_lastest_syscall_time: parent_inner.task_lastest_syscall_time,
-                    task_syscall_trace: parent_inner.task_syscall_trace,
-                    stride: parent_inner.stride,
-                    priority: parent_inner.priority,
+                    task_info:TaskInfo::new(),
+                    stride:0,
+                    pass:BIGSTRIDE/16,
+                    priority:16,
                 })
             },
         });
@@ -257,6 +280,17 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// spawn a process 
+    pub fn spawn(self:&Arc<Self>,elf_data: &[u8])->Arc<Self>{
+        // new a process
+        let mut parent_inner = self.inner_exclusive_access();
+        let new_process=Arc::new(TaskControlBlock::new(elf_data));
+        // parent - children connect
+        new_process.inner_exclusive_access().parent=Some(Arc::downgrade(self));
+        parent_inner.children.push(new_process.clone());
+        new_process
     }
 
     /// get pid of process
@@ -289,17 +323,6 @@ impl TaskControlBlock {
             None
         }
     }
-
-    /// Run a child process in current process
-    pub fn exec_process(&self, elf_data: &[u8]) -> Arc<TaskControlBlock> {
-        let current_task = current_task().unwrap();
-        let new_task = Arc::new(TaskControlBlock::new(&elf_data));
-
-        current_task.inner_exclusive_access().children.push(new_task.clone());
-        new_task.inner_exclusive_access().parent = Some(Arc::downgrade(&current_task));
-
-        new_task
-    } 
 }
 
 #[derive(Copy, Clone, PartialEq)]

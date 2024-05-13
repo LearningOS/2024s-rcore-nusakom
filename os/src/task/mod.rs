@@ -33,8 +33,8 @@ pub use task::{TaskControlBlock, TaskStatus};
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 pub use manager::add_task;
 pub use processor::{
-    allocate_memory, current_task, current_task_info, current_trap_cx, current_user_token, spawn_task,
-    free_memory, run_tasks, schedule, set_priority, take_current_task, update_task_info, Processor,
+    current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
+    Processor,
 };
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
@@ -46,6 +46,7 @@ pub fn suspend_current_and_run_next() {
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     // Change status to Ready
     task_inner.task_status = TaskStatus::Ready;
+    task_inner.get_info().init_time();
     drop(task_inner);
     // ---- release current PCB
 
@@ -79,7 +80,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // Record exit code
     inner.exit_code = exit_code;
     // do not move to its parent but under initproc
-
+    inner.get_info().init_time();
     // ++++++ access initproc TCB exclusively
     {
         let mut initproc_inner = INITPROC.inner_exclusive_access();
@@ -95,6 +96,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     inner.memory_set.recycle_data_pages();
     // drop file descriptors
     inner.fd_table.clear();
+    inner.fd_stat.clear();
     drop(inner);
     // **** release current PCB
     // drop task manually to maintain rc correctly

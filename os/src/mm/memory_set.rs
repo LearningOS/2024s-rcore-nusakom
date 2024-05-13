@@ -66,27 +66,6 @@ impl MemorySet {
             None,
         );
     }
-    /// free a framed area
-    pub fn free_framed_area(&mut self, start_address: VirtAddr, end_address: VirtAddr) {
-        let virtual_page_start = start_address.floor();
-        let virtual_page_end = end_address.ceil();
-        let index = self.areas.iter_mut().position(|map| {
-            map.vpn_range.get_start() == virtual_page_start
-                && map.vpn_range.get_end() == virtual_page_end
-        });
-
-        if let Some(index) = index {
-            self.areas[index].unmap(&mut self.page_table);
-            self.areas.remove(index);
-        }
-    }
-    /// Check if memory range include allocated memory
-    pub fn include_allocated(&self, start_address: VirtAddr, end_address: VirtAddr) -> bool {
-        self.areas.iter().any(|area| {
-            area.vpn_range.get_end() > start_address.floor()
-                && area.vpn_range.get_start() < end_address.ceil()
-        })
-    }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -338,6 +317,49 @@ impl MemorySet {
         } else {
             false
         }
+    }
+    /// 
+    pub fn mmap(&mut self,start_va: VirtAddr,end_va:VirtAddr,permission: MapPermission)->isize{
+        let vpn_range=VPNRange::new(start_va.floor(),end_va.ceil());
+        for vpn in vpn_range{
+            if let Some(pte)=self.page_table.translate(vpn){
+                if pte.is_valid(){
+                    return -1;
+                }
+            }else {
+                continue;
+            }
+        }
+        // map all
+        self.insert_framed_area(start_va, end_va, permission);
+        0
+    }
+    /// 
+    pub fn unmap(&mut self,start_va:VirtAddr,end_va:VirtAddr)->isize{
+        let vpn_range=VPNRange::new(start_va.floor(),end_va.ceil());
+        // find map
+        for vpn in vpn_range{
+            if let Some(pte)=self.page_table.translate(vpn){
+                if pte.is_valid(){
+                    continue;
+                }else {
+                    return -1;
+                }
+            }else {
+                return -1;
+            }
+        }
+        // unmap all
+        for vpn in vpn_range{
+            // let v:usize=vpn.into();
+            // println!("unmap v{}",v);
+            for area in self.areas.iter_mut(){
+                if vpn>=area.vpn_range.get_start() && vpn<area.vpn_range.get_end(){
+                    area.unmap_one(&mut self.page_table,vpn);
+                }
+            }
+        }
+        0
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory

@@ -4,15 +4,10 @@
 //! the current running state of CPU is recorded,
 //! and the replacement and transfer of control flow of different applications are executed.
 
-use super::{__switch, add_task};
+use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
-use crate::config::PAGE_SIZE;
-use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_str, MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
-use crate::syscall::process::TaskInfo;
-use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -61,6 +56,7 @@ pub fn run_tasks() {
     loop {
         let mut processor = PROCESSOR.exclusive_access();
         if let Some(task) = fetch_task() {
+            task.inner_exclusive_access().step();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
@@ -113,117 +109,4 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }
-}
-
-/// Get current task info
-pub fn current_task_info() -> TaskInfo {
-    let current_task_control_block = current_task().unwrap();
-    let current_task = current_task_control_block.inner_exclusive_access();
-
-    TaskInfo {
-        status: current_task.task_status,
-        syscall_times: current_task.task_syscall_trace,
-        time: {
-            let start = current_task.task_start_time;
-            let end = current_task.task_lastest_syscall_time;
-            end - start
-        },
-    }
-}
-
-/// Update task info
-pub fn update_task_info(syscall_id: usize) {
-    let current_task_control_block = current_task().unwrap();
-    let mut current_task = current_task_control_block.inner_exclusive_access();
-
-    current_task.task_lastest_syscall_time = get_time_ms();
-    current_task.task_syscall_trace[syscall_id] += 1;
-}
-
-/// Allocate memory
-pub fn allocate_memory(start: usize, len: usize, port: usize) -> isize {
-    // check
-    if start % PAGE_SIZE != 0 {
-        return -1;
-    }
-
-    if port & !0x7 != 0 || port & 0x7 == 0 {
-        return -1;
-    }
-
-    let start_address = VirtAddr::from(start);
-    let end_address = VirtAddr::from(start + len);
-
-    let current_task_control_block = current_task().unwrap();
-    let mut current_task = current_task_control_block.inner_exclusive_access();
-
-    if current_task
-        .memory_set
-        .include_allocated(start_address, end_address)
-    {
-        return -1;
-    }
-
-    let permissions = MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
-
-    current_task
-        .memory_set
-        .insert_framed_area(start_address, end_address, permissions);
-
-    0
-}
-
-/// Free memory
-pub fn free_memory(start: usize, len: usize) -> isize {
-    if start % PAGE_SIZE != 0 {
-        return -1;
-    }
-
-    let start_address = VirtAddr::from(start);
-    let end_address = VirtAddr::from(start + len);
-
-    if !start_address.aligned() {
-        return -1;
-    }
-
-    if !end_address.aligned() {
-        return -1;
-    }
-
-    let current_task_control_block = current_task().unwrap();
-    let mut current_task = current_task_control_block.inner_exclusive_access();
-
-    current_task
-        .memory_set
-        .free_framed_area(start_address, end_address);
-
-    0
-}
-
-/// Spawn a new task
-pub fn spawn_task(path: *const u8) -> isize {
-    let token = current_user_token();
-    let path = translated_str(token, path);
-    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
-        let elf_data = app_inode.read_all();
-        let task = current_task().unwrap().exec_process(&elf_data);
-
-        add_task(task.clone());
-        task.pid.0 as isize
-    } else {
-        -1
-    }
-}
-
-/// Set task priority
-pub fn set_priority(priority: isize) -> isize {
-    if priority < 2 {
-        return -1;
-    }
-
-    let cpu_cur_task = current_task().unwrap();
-    let mut task_inner = cpu_cur_task.inner_exclusive_access();
-    task_inner.priority = priority;
-
-    task_inner.priority
 }
