@@ -1,4 +1,5 @@
 //!An easy file system isolated from the kernel
+pub use efs::EasyFileSystem;
 #![no_std]
 #![deny(missing_docs)]
 extern crate alloc;
