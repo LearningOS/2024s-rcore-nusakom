@@ -1,16 +1,16 @@
 //! Types related to task management & Functions for completely changing TCB
-use super::TaskContext;
+use super::{current_task, TaskContext};
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::{TRAP_CONTEXT_BASE, MAX_SYSCALL_NUM};
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE, MapPermission};
+use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use crate::timer::get_time_ms;
 
 /// Task control block structure
 ///
@@ -18,10 +18,10 @@ use crate::timer::get_time_ms;
 pub struct TaskControlBlock {
     // Immutable
     /// Process identifier
-    pub pid: PidHandle,
+    pub(crate) pid: PidHandle,
 
     /// Kernel stack corresponding to PID
-    pub kernel_stack: KernelStack,
+    pub(crate) kernel_stack: KernelStack,
 
     /// Mutable
     inner: UPSafeCell<TaskControlBlockInner>,
@@ -65,6 +65,8 @@ pub struct TaskControlBlockInner {
 
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
+
+    /// File Descriptor Table: Record the files opened by this task
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 
     /// Heap bottom
@@ -73,23 +75,20 @@ pub struct TaskControlBlockInner {
     /// Program break
     pub program_brk: usize,
 
-    pub task_info: TaskInfo,
+    /// The start time of task
     pub task_start_time: usize,
 
-    pub priority: isize,
-    pub stride: isize,
-}
+    /// The end time of task syscall
+    pub task_lastest_syscall_time: usize,
 
-/// Task information
-#[allow(dead_code)]
-#[derive(Copy, Clone)]
-pub struct TaskInfo {
-    /// Task status in it's life cycle
-    status: TaskStatus,
     /// The numbers of syscall called by task
-    syscall_times: [u32; MAX_SYSCALL_NUM],
-    /// Total running time of task
-    time: usize,
+    pub task_syscall_trace: [u32; MAX_SYSCALL_NUM],
+
+    /// The stride of the task
+    pub stride: isize,
+
+    /// The priority of the task
+    pub priority: isize,
 }
 
 impl TaskControlBlockInner {
@@ -111,22 +110,6 @@ impl TaskControlBlockInner {
         } else {
             self.fd_table.push(None);
             self.fd_table.len() - 1
-        }
-    }
-
-    pub fn m_map(&mut self, start: usize, len: usize, port: usize) -> isize {
-        if start % 4096 == 0 && (port & !0x7 == 0) && (port & 0x7 != 0) {
-            self.memory_set.insert_my_area(VirtAddr::from(start), VirtAddr::from(start + len), MapPermission::from_usize((port << 1) | 0x18))
-        } else {
-            -1
-        }
-    }
-
-    pub fn m_unmap(&mut self, start: usize, len: usize) -> isize {
-        if start % 4096 == 0 && len % 4096 == 0 {
-            self.memory_set.remove_area(VirtAddr::from(start), VirtAddr::from(start + len))
-        } else {
-            -1
         }
     }
 }
@@ -170,10 +153,11 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
-                    task_info: TaskInfo::new(TaskStatus::Ready),
-                    task_start_time: 0,
-                    priority: 16,
+                    task_start_time: get_time_ms(),
+                    task_lastest_syscall_time: get_time_ms(),
+                    task_syscall_trace: [0; MAX_SYSCALL_NUM],
                     stride: 0,
+                    priority: 0,
                 })
             },
         };
@@ -255,10 +239,11 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
-                    task_info: TaskInfo::new(TaskStatus::Ready),
-                    task_start_time: get_time_ms(),
-                    priority: 16,
-                    stride: 0,
+                    task_start_time: parent_inner.task_start_time,
+                    task_lastest_syscall_time: parent_inner.task_lastest_syscall_time,
+                    task_syscall_trace: parent_inner.task_syscall_trace,
+                    stride: parent_inner.stride,
+                    priority: parent_inner.priority,
                 })
             },
         });
@@ -304,33 +289,17 @@ impl TaskControlBlock {
             None
         }
     }
-}
 
-impl TaskInfo {
-    pub fn new(status: TaskStatus) -> Self {
-        // Initialize syscall_times with zeros.
-        let syscall_times = [0; MAX_SYSCALL_NUM];
-        // Assuming TaskStatus::Running is a reasonable default.
-        TaskInfo {
-            status,
-            syscall_times,
-            time: 0,
-        }
-    }
+    /// Run a child process in current process
+    pub fn exec_process(&self, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let current_task = current_task().unwrap();
+        let new_task = Arc::new(TaskControlBlock::new(&elf_data));
 
-    pub fn set_status(&mut self, status: TaskStatus) {
-        self.status = status;
-    }
+        current_task.inner_exclusive_access().children.push(new_task.clone());
+        new_task.inner_exclusive_access().parent = Some(Arc::downgrade(&current_task));
 
-    pub fn add_syscall_time(&mut self, index: usize) {
-        if index < MAX_SYSCALL_NUM {
-            self.syscall_times[index] += 1;
-        }
-    }
-
-    pub fn increment_time(&mut self, increment: usize) {
-        self.time = increment;
-    }
+        new_task
+    } 
 }
 
 #[derive(Copy, Clone, PartialEq)]

@@ -4,22 +4,15 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use alloc::collections::VecDeque;
-use alloc::string::String;
 use super::{File, Stat, StatMode};
-use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
+use crate::{drivers::BLOCK_DEVICE, fs::map::SimpleMap};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefMut;
 use bitflags::*;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
-
-pub struct OSInodeManager {
-    inode_queue: VecDeque<Arc<OSInode>>,
-}
 
 /// inode in memory
 /// A wrapper around a filesystem inode
@@ -27,8 +20,6 @@ pub struct OSInodeManager {
 pub struct OSInode {
     readable: bool,
     writable: bool,
-    stat: Stat,
-    name: String,
     inner: UPSafeCell<OSInodeInner>,
 }
 /// The OS inode inner in 'UPSafeCell'
@@ -37,24 +28,13 @@ pub struct OSInodeInner {
     inode: Arc<Inode>,
 }
 
-pub struct LinkName {
-    old_path: String,
-    new_path: String,
-}
-
-pub struct LinkManager {
-    name_queue: VecDeque<Arc<LinkName>>,
-}
-
 impl OSInode {
     /// create a new inode in memory
-    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>, ino: u64, nlink: u32,stat_mode: StatMode, name: String) -> Self {
+    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
         Self {
             readable,
             writable,
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
-            stat: Stat::new(ino, nlink, stat_mode),
-            name,
         }
     }
     /// read all data from the inode
@@ -72,12 +52,26 @@ impl OSInode {
         }
         v
     }
+
+    /// check if the inode is flag deleted
+    pub fn is_deleted(&self, name: &str) -> bool {
+        self.inner.exclusive_access().inode.is_removed(name)
+    }
+
+    /// check if the inode is a link
+    pub fn is_link(&self) -> bool {
+        self.inner.exclusive_access().inode.is_link()
+    }
 }
 
 lazy_static! {
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
+    };
+    pub static ref INODE_LINK_MAP: UPSafeCell<SimpleMap<u32, u32>> = {
+        let map = SimpleMap::new();
+        unsafe { UPSafeCell::new(map) }
     };
 }
 
@@ -86,7 +80,6 @@ pub fn list_apps() {
     println!("/**** APPS ****");
     for app in ROOT_INODE.ls() {
         println!("{}", app);
-        LINK_MANAGER.exclusive_access().add(app.clone().as_str(), "none_name_just_test_made_by_OSFantasy");
     }
     println!("**************/");
 }
@@ -121,48 +114,29 @@ impl OpenFlags {
     }
 }
 
-
-
 /// Open a file
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let (readable, writable) = flags.read_write();
-
-    let mut link_manager = LINK_MANAGER.exclusive_access();
-    let (name, nlink, index)= link_manager.all(name, flags.clone());
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
             // clear size
             inode.clear();
-            Some(Arc::new(OSInode::new(readable, writable, inode, index as u64, nlink as u32, StatMode::FILE, String::from(name))))
+            Some(Arc::new(OSInode::new(readable, writable, inode)))
         } else {
             // create file
             ROOT_INODE
                 .create(name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode, index as u64, nlink as u32, StatMode::FILE, String::from(name))))
+                .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
         }
     } else {
-        if nlink != 0 {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.clear();
             }
-            Arc::new(OSInode::new(readable, writable, inode, index as u64, nlink as u32, StatMode::FILE, String::from(name)))
+            Arc::new(OSInode::new(readable, writable, inode))
         })
-        } else {
-            None
-        }
     }
 }
-
-// pub fn update_file(name: &str, flags: OpenFlags){
-//
-// }
-
-// impl OSInode {
-//     pub fn exclusive_access(&self) -> RefMut<'_, OSInode> {
-//         self.exclusive_access()
-//     }
-// }
 
 impl File for OSInode {
     fn readable(&self) -> bool {
@@ -195,110 +169,81 @@ impl File for OSInode {
         }
         total_write_size
     }
+    fn stat(&self) -> Option<Stat> {
+        let inner = self.inner.exclusive_access();
 
-    fn file_stat(&self) -> Stat {
-        let mut stat = self.stat.clone();
-        let name = self.name.as_str();
-        let mut link_manager = LINK_MANAGER.exclusive_access();
-        let (name, nlink, index)= link_manager.all(name, OpenFlags::RDWR);
-        stat.nlink = nlink as u32;
-        stat.ino = index as u64;
-        stat
+        Some(Stat {
+            dev: 0,
+            ino: inner.inode.get_inode().into(),
+            mode: {
+                match inner.inode.is_dir() {
+                    true => StatMode::DIR,
+                    false => StatMode::FILE,
+                }
+            },
+            nlink: {
+                let map = INODE_LINK_MAP.exclusive_access();
+                let count = map
+                    .get((&inner.inode.get_inode()).into())
+                    .cloned()
+                    .unwrap_or(1);
+
+                count
+            },
+            pad: [0; 7],
+        })
     }
 }
 
-impl LinkManager {
-    ///Creat an empty TaskManager
-    pub fn new() -> Self {
-        Self {
-            name_queue: VecDeque::new(),
-        }
+/// link two files
+pub fn linkat(old_name: &str, new_name: &str) -> isize {
+    if old_name == new_name {
+        return -1;
     }
 
-    pub fn all<'a>(&'a mut self, name: &'a str, flags: OpenFlags) -> (&'a str, usize, usize) {
-        if flags.contains(OpenFlags::CREATE) {
-            println!("[Kernel][link]all , add:{}", name.clone());
-            self.add(name.clone(), "none_name_just_test_made_by_OSFantasy");
-        }
-        let fetched_name = self.fetch(name);
-        let nlink = self.find_num(&fetched_name);
-        let index = self.find_index(&fetched_name);
-        (fetched_name, nlink, index)
-    }
+    let old_file = ROOT_INODE.find(old_name);
 
-    /// Add process back to ready queue
-    pub fn add(&mut self, old_name: &str, new_name: &str) -> isize {
-        if old_name == new_name {
-            return -1;
-        }
+    match old_file {
+        Some(inode) => {
+            let new_file = ROOT_INODE.create_link(new_name, inode.get_inode());
 
-        let link_name = LinkName {
-            old_path: old_name.parse().unwrap(),
-            new_path: new_name.parse().unwrap(),
-        };
-        self.name_queue.push_back(Arc::from(link_name));
-        0
-    }
+            match new_file {
+                Some(file) => {
+                    // increase link count
+                    let mut inner = INODE_LINK_MAP.exclusive_access();
+                    let old_count = inner.get(&file.get_inode().into()).cloned().unwrap_or(1);
+                    inner.insert(inode.get_inode().into(), old_count + 1);
 
-    pub fn remove(&mut self, name: &str) -> isize {
-        let mut result: isize = -1;
-        let mut remove_index: usize = 0;
-
-        for (index, link_name) in self.name_queue.iter().enumerate() {
-            let old_name = link_name.old_path.as_str();
-            let new_name = link_name.new_path.as_str();
-            if old_name == name || new_name == name  {
-                remove_index = index;
-                result = 0;
-                println!("find remove_index is {}, old_name = {}, new_name = {}", remove_index, old_name, new_name);
-                break;
+                    0
+                }
+                None => -1,
             }
         }
-
-        if result == 0 {
-            self.name_queue.remove(remove_index);
-        }
-
-        result
+        None => -1,
     }
-    /// Take a process out of the ready queue
-    pub fn fetch<'a>(&'a self, name: &'a str) -> &'a str {
-        if let Some(index) = self.name_queue.iter().position(|link_name| {
-            Arc::clone(link_name).old_path == name || Arc::clone(link_name).new_path == name
-        }) {
-            self.name_queue[index].old_path.as_str()
-        } else {
-            println!("[Kernel][fs][inode]Not fetch the name in LINK_MANAGER");
-            name
-        }
-    }
-
-    pub fn find_num(&self, name: &str) -> usize {
-        let count = self.name_queue.iter().filter(|link_name| {
-            Arc::clone(link_name).old_path == name
-        }).count();
-
-        if count == 0 {
-            println!("[Kernel][fs][inode] Not fetch the name in LINK_MANAGER");
-        }
-
-        count
-    }
-
-    pub fn find_index(&self, name: &str) -> usize {
-        if let Some(index) = self.name_queue.iter().position(|link_name| {
-            Arc::clone(link_name).old_path == name
-        }) {
-            return index;
-        } else {
-            self.name_queue.len()
-        }
-    }
-
 }
 
-lazy_static! {
-    /// TASK_MANAGER instance through lazy_static!
-    pub static ref LINK_MANAGER: UPSafeCell<LinkManager> =
-        unsafe { UPSafeCell::new(LinkManager::new()) };
+/// unlink a file
+pub fn unlinkat(file_name: &str) -> isize {
+    let inode = ROOT_INODE.find(file_name);
+
+    // return if file not exist.
+    match inode {
+        Some(inode) => {
+            // flag in remove
+            inode.unlink(file_name);
+
+            // decrease link count
+            let mut inner = INODE_LINK_MAP.exclusive_access();
+            let old_count = inner.get(&inode.get_inode().into()).cloned().unwrap_or(1);
+            inner.insert(inode.get_inode().into(), old_count - 1);
+
+            if old_count == 0 {
+                inner.remove(&inode.get_inode().into());
+            }
+
+            0
+        }
+        None => -1,
+    }
 }

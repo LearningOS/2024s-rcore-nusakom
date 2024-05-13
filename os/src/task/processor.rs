@@ -4,12 +4,16 @@
 //! the current running state of CPU is recorded,
 //! and the replacement and transfer of control flow of different applications are executed.
 
-use super::{__switch, TaskInfo};
-use super::{fetch_task, TaskStatus, fetch_min_task};
+use super::{__switch, add_task};
+use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
+use crate::config::PAGE_SIZE;
+use crate::fs::{open_file, OpenFlags};
+use crate::mm::{translated_str, MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
-use crate::trap::TrapContext;
+use crate::syscall::process::TaskInfo;
 use crate::timer::get_time_ms;
+use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
 
@@ -45,44 +49,6 @@ impl Processor {
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
     }
-
-    pub fn update_task_info(&mut self, syscall: usize, add_flag: bool) {
-        let binding = self.current().unwrap();
-        let mut task = binding.inner_exclusive_access();
-        let task_status = task.task_status;
-        task.task_info.set_status(task_status);
-        if add_flag {
-            task.task_info.add_syscall_time(syscall);
-        }
-    }
-
-    pub fn get_current_task_info(&mut self) -> TaskInfo {
-        self.update_task_info(0,false);
-        let binding = self.current().unwrap();
-        let mut task = binding.inner_exclusive_access();
-        let task_start_time = task.task_start_time;
-        let increment_time = get_time_ms()-task_start_time;
-        println!("[Kernel][Task] get_time_ms = {}", get_time_ms());
-        println!("[Kernel][Task] task_start_time = {}", task_start_time);
-        println!("[Kernel][Task] increment_time = {}", increment_time);
-        task.task_info.increment_time(increment_time);
-        let task_info = task.task_info;
-        task_info
-    }
-
-    pub fn current_task_m_map(&mut self, start: usize, len: usize, port: usize) -> isize {
-        println!("[Kernel][task/mod]m_map");
-        let binding = self.current().unwrap();
-        let mut task = binding.inner_exclusive_access();
-        task.m_map(start, len, port)
-    }
-
-    pub fn current_task_m_unmap(&mut self, start: usize, len: usize) -> isize {
-        println!("[Kernel][task/mod]m_unmap");
-        let binding = self.current().unwrap();
-        let mut task = binding.inner_exclusive_access();
-        task.m_unmap(start, len)
-    }
 }
 
 lazy_static! {
@@ -94,7 +60,7 @@ lazy_static! {
 pub fn run_tasks() {
     loop {
         let mut processor = PROCESSOR.exclusive_access();
-        if let Some(task) = fetch_min_task() {
+        if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
@@ -149,18 +115,115 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     }
 }
 
-pub fn get_current_processor_info() -> TaskInfo {
-    PROCESSOR.exclusive_access().get_current_task_info()
+/// Get current task info
+pub fn current_task_info() -> TaskInfo {
+    let current_task_control_block = current_task().unwrap();
+    let current_task = current_task_control_block.inner_exclusive_access();
+
+    TaskInfo {
+        status: current_task.task_status,
+        syscall_times: current_task.task_syscall_trace,
+        time: {
+            let start = current_task.task_start_time;
+            let end = current_task.task_lastest_syscall_time;
+            end - start
+        },
+    }
 }
 
-pub fn add_processor_syscall_times(syscall: usize){
-    PROCESSOR.exclusive_access().update_task_info(syscall, true);
+/// Update task info
+pub fn update_task_info(syscall_id: usize) {
+    let current_task_control_block = current_task().unwrap();
+    let mut current_task = current_task_control_block.inner_exclusive_access();
+
+    current_task.task_lastest_syscall_time = get_time_ms();
+    current_task.task_syscall_trace[syscall_id] += 1;
 }
 
-pub fn current_processor_m_map(start: usize, len: usize, port: usize) -> isize {
-    PROCESSOR.exclusive_access().current_task_m_map(start, len, port)
+/// Allocate memory
+pub fn allocate_memory(start: usize, len: usize, port: usize) -> isize {
+    // check
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+
+    if port & !0x7 != 0 || port & 0x7 == 0 {
+        return -1;
+    }
+
+    let start_address = VirtAddr::from(start);
+    let end_address = VirtAddr::from(start + len);
+
+    let current_task_control_block = current_task().unwrap();
+    let mut current_task = current_task_control_block.inner_exclusive_access();
+
+    if current_task
+        .memory_set
+        .include_allocated(start_address, end_address)
+    {
+        return -1;
+    }
+
+    let permissions = MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
+
+    current_task
+        .memory_set
+        .insert_framed_area(start_address, end_address, permissions);
+
+    0
 }
 
-pub fn current_processor_m_unmap(start: usize, len: usize) -> isize {
-    PROCESSOR.exclusive_access().current_task_m_unmap(start, len)
+/// Free memory
+pub fn free_memory(start: usize, len: usize) -> isize {
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+
+    let start_address = VirtAddr::from(start);
+    let end_address = VirtAddr::from(start + len);
+
+    if !start_address.aligned() {
+        return -1;
+    }
+
+    if !end_address.aligned() {
+        return -1;
+    }
+
+    let current_task_control_block = current_task().unwrap();
+    let mut current_task = current_task_control_block.inner_exclusive_access();
+
+    current_task
+        .memory_set
+        .free_framed_area(start_address, end_address);
+
+    0
+}
+
+/// Spawn a new task
+pub fn spawn_task(path: *const u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let elf_data = app_inode.read_all();
+        let task = current_task().unwrap().exec_process(&elf_data);
+
+        add_task(task.clone());
+        task.pid.0 as isize
+    } else {
+        -1
+    }
+}
+
+/// Set task priority
+pub fn set_priority(priority: isize) -> isize {
+    if priority < 2 {
+        return -1;
+    }
+
+    let cpu_cur_task = current_task().unwrap();
+    let mut task_inner = cpu_cur_task.inner_exclusive_access();
+    task_inner.priority = priority;
+
+    task_inner.priority
 }
