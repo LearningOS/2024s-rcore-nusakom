@@ -1,5 +1,5 @@
 //!Stdin & Stdout
-use super::{File, Stat, StatMode};
+use super::File;
 use crate::mm::UserBuffer;
 use crate::sbi::console_getchar;
 use crate::task::suspend_current_and_run_next;
@@ -39,9 +39,8 @@ impl File for Stdin {
     fn write(&self, _user_buf: UserBuffer) -> usize {
         panic!("Cannot write to stdin!");
     }
-
-    fn file_stat(&self) -> Stat {
-        Stat::new(0, 1,StatMode::FILE)
+    fn stat(&self) -> Option<super::Stat> {
+        None
     }
 }
 
@@ -61,7 +60,7 @@ impl File for Stdout {
         }
         user_buf.len()
     }
-    fn file_stat(&self) -> Stat {
-        Stat::new(0, 1, StatMode::FILE)
+    fn stat(&self) -> Option<super::Stat> {
+        None
     }
 }
