@@ -5,9 +5,9 @@
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
 use super::{File, Stat, StatMode};
+use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
-use crate::{drivers::BLOCK_DEVICE, fs::map::SimpleMap};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -52,26 +52,12 @@ impl OSInode {
         }
         v
     }
-
-    /// check if the inode is flag deleted
-    pub fn is_deleted(&self, name: &str) -> bool {
-        self.inner.exclusive_access().inode.is_removed(name)
-    }
-
-    /// check if the inode is a link
-    pub fn is_link(&self) -> bool {
-        self.inner.exclusive_access().inode.is_link()
-    }
 }
 
 lazy_static! {
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
-    };
-    pub static ref INODE_LINK_MAP: UPSafeCell<SimpleMap<u32, u32>> = {
-        let map = SimpleMap::new();
-        unsafe { UPSafeCell::new(map) }
     };
 }
 
@@ -138,6 +124,25 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// link a file
+pub fn link_file(old_name: &str, new_name: &str) -> isize {
+    if let Some(inode) = ROOT_INODE.find(old_name) {
+        ROOT_INODE.link(inode, new_name)
+    } else {
+        -1
+    }
+}
+
+/// unlink a file
+pub fn unlink_file(name: &str) -> isize {
+    let inode = match ROOT_INODE.find(name) {
+        Some(inode) => inode,
+        None => return -1,
+    };
+
+    ROOT_INODE.unlink(inode, name)
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -169,81 +174,20 @@ impl File for OSInode {
         }
         total_write_size
     }
-    fn stat(&self) -> Option<Stat> {
+    fn stat(&self) -> Stat {
         let inner = self.inner.exclusive_access();
-
-        Some(Stat {
-            dev: 0,
-            ino: inner.inode.get_inode().into(),
-            mode: {
-                match inner.inode.is_dir() {
-                    true => StatMode::DIR,
-                    false => StatMode::FILE,
-                }
+        let info = inner.inode.stat();
+        Stat::new(
+            0,
+            info.0 as u64,
+            if info.1 {
+                StatMode::FILE
+            } else if info.2 {
+                StatMode::DIR
+            } else {
+                StatMode::NULL
             },
-            nlink: {
-                let map = INODE_LINK_MAP.exclusive_access();
-                let count = map
-                    .get((&inner.inode.get_inode()).into())
-                    .cloned()
-                    .unwrap_or(1);
-
-                count
-            },
-            pad: [0; 7],
-        })
-    }
-}
-
-/// link two files
-pub fn linkat(old_name: &str, new_name: &str) -> isize {
-    if old_name == new_name {
-        return -1;
-    }
-
-    let old_file = ROOT_INODE.find(old_name);
-
-    match old_file {
-        Some(inode) => {
-            let new_file = ROOT_INODE.create_link(new_name, inode.get_inode());
-
-            match new_file {
-                Some(file) => {
-                    // increase link count
-                    let mut inner = INODE_LINK_MAP.exclusive_access();
-                    let old_count = inner.get(&file.get_inode().into()).cloned().unwrap_or(1);
-                    inner.insert(inode.get_inode().into(), old_count + 1);
-
-                    0
-                }
-                None => -1,
-            }
-        }
-        None => -1,
-    }
-}
-
-/// unlink a file
-pub fn unlinkat(file_name: &str) -> isize {
-    let inode = ROOT_INODE.find(file_name);
-
-    // return if file not exist.
-    match inode {
-        Some(inode) => {
-            // flag in remove
-            inode.unlink(file_name);
-
-            // decrease link count
-            let mut inner = INODE_LINK_MAP.exclusive_access();
-            let old_count = inner.get(&inode.get_inode().into()).cloned().unwrap_or(1);
-            inner.insert(inode.get_inode().into(), old_count - 1);
-
-            if old_count == 0 {
-                inner.remove(&inode.get_inode().into());
-            }
-
-            0
-        }
-        None => -1,
+            info.3 as u32,
+        )
     }
 }

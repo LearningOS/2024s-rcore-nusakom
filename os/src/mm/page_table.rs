@@ -126,14 +126,12 @@ impl PageTable {
         result
     }
     /// set the map between virtual page number and physical page number
-    #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
         let pte = self.find_pte_create(vpn).unwrap();
         assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
     /// remove the map between virtual page number and physical page number
-    #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
@@ -217,26 +215,6 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .translate_va(VirtAddr::from(va))
         .unwrap()
         .get_mut()
-}
-
-/// get the physical address from the virtual address
-pub fn get_physocal_address(token: usize, ptr: usize) -> usize {
-    let page_table = PageTable::from_token(token);
-
-    // get the virtual address and the offset
-    let virtual_address = VirtAddr::from(ptr);
-    let offset_address = virtual_address.page_offset();
-
-    // get the physical address
-    let virt_page_num = virtual_address.floor();
-    let physical_page_num = match page_table.translate(virt_page_num) {
-        Some(virt_page_num) => virt_page_num.ppn(),
-        None => panic!("Invalid address: 0x{:x}", ptr),
-    };
-
-    let physical_address = physical_page_num.0 << 12 | offset_address;
-
-    physical_address
 }
 
 /// An abstraction over a buffer passed from user space to kernel space

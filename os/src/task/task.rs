@@ -1,16 +1,16 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::{TRAP_CONTEXT_BASE,BIGSTRIDE};
-use crate::fs::{File, Stdin, Stdout, StatMode};
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
+use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use crate::syscall::TaskInfo;
 
 /// Task control block structure
 ///
@@ -37,11 +37,6 @@ impl TaskControlBlock {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
     }
-    //  pub fn get_info(&mut self)->&mut TaskInfo{
-    //     self.inner.exclusive_access().get_info()
-    //     // &mut self.task_info
-    // }
-    
 }
 
 pub struct TaskControlBlockInner {
@@ -70,7 +65,6 @@ pub struct TaskControlBlockInner {
 
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
-    pub fd_stat:Vec<Option<(u32,StatMode)>>,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 
     /// Heap bottom
@@ -79,26 +73,20 @@ pub struct TaskControlBlockInner {
     /// Program break
     pub program_brk: usize,
 
-    /// task info
-    pub task_info:TaskInfo,
+    /// The numbers of syscall called by task
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
 
-    /// stride
-    pub stride:isize,
+    /// Total running time of task
+    pub first_run: usize,
 
-    /// stride pass
-    pass:isize,
+    /// The stride of the process
+    pub stride: usize,
 
-    /// priority
-    priority:isize
+    /// The priority of the process
+    pub priority: usize,
 }
 
 impl TaskControlBlockInner {
-
-    pub fn get_stride(&self) -> isize{
-        self.stride
-    }
-
-    /// get the trap context
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
         self.trap_cx_ppn.get_mut()
     }
@@ -111,27 +99,11 @@ impl TaskControlBlockInner {
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
-    /// get task_info
-    pub fn get_info(&mut self)->&mut TaskInfo{
-        &mut self.task_info
-    }
-
-    /// set priority
-    pub fn set_proority(&mut self,priority:isize){
-        self.priority=priority;
-        self.pass=BIGSTRIDE/priority;
-    } 
-
-    /// step add pass to stride
-    pub fn step(&mut self){
-        self.stride+=self.pass
-    }
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             fd
         } else {
             self.fd_table.push(None);
-            self.fd_stat.push(None);
             self.fd_table.len() - 1
         }
     }
@@ -165,8 +137,7 @@ impl TaskControlBlock {
                     memory_set,
                     parent: None,
                     children: Vec::new(),
-                    exit_code: 0,                          // don't learn this 
-                    fd_stat:vec![Some((0,StatMode::FILE)),Some((1,StatMode::FILE)),Some((2,StatMode::FILE))],
+                    exit_code: 0,
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -177,13 +148,71 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
-                    task_info:TaskInfo::new(),
-                    stride:0,
-                    pass:BIGSTRIDE/16,
-                    priority:16,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    first_run: 0,
+                    stride: 0,
+                    priority: 16,
                 })
             },
         };
+        // prepare TrapContext in user space
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
+    }
+
+    /// Create a new process
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // memory_set with elf program headers/trampoline/trap context/user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        // push a task context which goes to trap_return to the top of kernel stack
+        let task_control_block = Arc::new(Self {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    first_run: 0,
+                    stride: 0,
+                    priority: 16,
+                })
+            },
+        });
+        // add child
+        let mut parent_inner = self.inner_exclusive_access();
+        parent_inner.children.push(task_control_block.clone());
         // prepare TrapContext in user space
         let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
         *trap_cx = TrapContext::app_init_context(
@@ -211,6 +240,9 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
+        // update task info
+        inner.syscall_times = [0; MAX_SYSCALL_NUM];
+        inner.first_run = get_time_ms();
         // initialize trap_cx
         let trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -259,14 +291,13 @@ impl TaskControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
-                    fd_stat:parent_inner.fd_stat.clone(),
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
-                    task_info:TaskInfo::new(),
-                    stride:0,
-                    pass:BIGSTRIDE/16,
-                    priority:16,
+                    syscall_times: parent_inner.syscall_times, // TODO
+                    first_run: 0,
+                    stride: 0,
+                    priority: 16,
                 })
             },
         });
@@ -280,17 +311,6 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
-    }
-
-    /// spawn a process 
-    pub fn spawn(self:&Arc<Self>,elf_data: &[u8])->Arc<Self>{
-        // new a process
-        let mut parent_inner = self.inner_exclusive_access();
-        let new_process=Arc::new(TaskControlBlock::new(elf_data));
-        // parent - children connect
-        new_process.inner_exclusive_access().parent=Some(Arc::downgrade(self));
-        parent_inner.children.push(new_process.clone());
-        new_process
     }
 
     /// get pid of process
